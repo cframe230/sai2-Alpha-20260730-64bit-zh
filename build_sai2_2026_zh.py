@@ -55,11 +55,6 @@ else:
     default_output = ROOT / "Sai2_2026_简体中文"
 OUTPUT = Path(os.environ["SAI2_ZH_OUTPUT"]) if os.environ.get("SAI2_ZH_OUTPUT") else default_output
 
-REPORT_PATH = (
-    SCRIPT_DIR / "translation_report.json"
-    if LOCAL_PACKAGE is not None
-    else REPO_ROOT / "tools" / "translation_report.json"
-)
 README_TEMPLATE = first_existing(
     SCRIPT_DIR / "汉化说明模板.txt",
     REPO_ROOT / "tools" / "汉化说明模板.txt",
@@ -665,10 +660,9 @@ def main() -> int:
         if actual != expected:
             raise ValueError(f"Unexpected source hash for {path}: {actual}")
 
-    image, records, english_records, translation_targets = build_translation_inputs()
+    image, records, _english_records, translation_targets = build_translation_inputs()
 
     proposals = []
-    sources = {"translation.json": len(records)}
     for record, target in zip(records, translation_targets):
         source = record["value"]
         item = {**record, "translation": target, "origin": "translation.json"}
@@ -677,20 +671,6 @@ def main() -> int:
     changed = [proposal for proposal in proposals if proposal["translation"] != proposal["value"]]
     unique_targets = list(dict.fromkeys(proposal["translation"] for proposal in changed))
     section_strings = unique_targets + ([UI_FONT_NAME] if UI_FONT_NAME not in unique_targets else [])
-
-    report = {
-        "source_version": "2026.07.30",
-        "source_sha256": EXPECTED_HASHES["2026.07.30 original"],
-        "japanese_records": len(records),
-        "records_by_translation_source": sources,
-        "patched_locale_records": len(changed),
-        "unique_chinese_strings": len(unique_targets),
-        "translations": [
-            {"key": p["key"], "ja": p["value"], "zh_cn": p["translation"], "en": p.get("english", ""), "origin": p["origin"]}
-            for p in proposals
-        ],
-    }
-    REPORT_PATH.write_text(json.dumps(report, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
 
     original_data = bytes(image.data)
     original_length = len(original_data)
@@ -739,13 +719,11 @@ def main() -> int:
     if in_place:
         # Build and validate in memory first; only now replace the executable.
         write_executable(OUTPUT / "sai2.exe", image.data)
-        shutil.copy2(NEW_ORIGINAL, OUTPUT / "sai2.original.exe")
     else:
         if OUTPUT.exists():
             shutil.rmtree(OUTPUT)
         shutil.copytree(OFFICIAL_PACKAGE, OUTPUT)
         write_executable(OUTPUT / "sai2.exe", image.data)
-        shutil.copy2(NEW_ORIGINAL, OUTPUT / "sai2.original.exe")
     if README_TEMPLATE and README_TEMPLATE.exists():
         shutil.copy2(README_TEMPLATE, OUTPUT / "汉化说明.txt")
     else:
@@ -762,15 +740,11 @@ def main() -> int:
         ini = re.sub(r"(?m)^lang\s*=\s*en\s*$", "lang = ja", ini, count=1)
         ini_path.write_text(ini, encoding=ini_encoding, newline="\r\n")
 
-    report["output_sha256"] = sha256(OUTPUT / "sai2.exe")
-    report["pe_checksum"] = f"0x{checksum:08X}"
-    report["added_section"] = {"name": ".zhcn", "rva": f"0x{new_section_rva:X}", "bytes": len(string_payload)}
-    report["ui_font"] = UI_FONT_NAME
-    REPORT_PATH.write_text(json.dumps(report, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+    output_sha256 = sha256(OUTPUT / "sai2.exe")
     print(f"Built: {OUTPUT}")
     print(f"Patched locale records: {len(changed)}")
     print(f"Unique Chinese strings: {len(unique_targets)}")
-    print(f"Output SHA-256: {report['output_sha256']}")
+    print(f"Output SHA-256: {output_sha256}")
     return 0
 
 
