@@ -1,15 +1,13 @@
 #!/usr/bin/env python3
-"""Build a Simplified Chinese resource patch for PaintTool SAI 2 2026.07.30.
+"""Automatically adapt and apply the Simplified Chinese SAI2 UI patch.
 
-The program code is not modified.  This script replaces strings in the built-in
-Japanese locale with Chinese strings.  When copied beside a SAI installation,
-it updates that installation's sai2.exe in place and keeps the .bak rollback
-copy untouched.  In the development repository it still writes an independent
-output folder.  License files and third-party executable patches are not edited.
+The patcher discovers locale records and font references from the PE image. It
+does not depend on a version hash, fixed file offsets, or record ordering.
 """
 
 from __future__ import annotations
 
+import argparse
 import hashlib
 import json
 import os
@@ -18,74 +16,34 @@ import re
 import shutil
 import struct
 import sys
+import threading
+import traceback
 
 
-SCRIPT_DIR = Path(__file__).resolve().parent
-REPO_ROOT = SCRIPT_DIR.parent
-
-
-def first_existing(*paths: Path | None) -> Path | None:
-    """Return the first existing path, preserving a useful fallback path."""
-    for path in paths:
-        if path is not None and path.exists():
-            return path
-    return next((path for path in paths if path is not None), None)
-
-
-# When the script is copied beside the SAI files shown in the user's folder
-# layout, use that folder as the package root.  In the development repository
-# it remains under tools/, so the original repository layout continues to work.
-LOCAL_PACKAGE = (
-    SCRIPT_DIR
-    if (SCRIPT_DIR / "sai2.exe.1785683660.bak").exists()
-    and (SCRIPT_DIR / "sai2.ini").exists()
-    else None
-)
-ROOT = LOCAL_PACKAGE or REPO_ROOT
-
-if LOCAL_PACKAGE is not None:
-    NEW_ORIGINAL = LOCAL_PACKAGE / "sai2.exe.1785683660.bak"
-    OFFICIAL_PACKAGE = LOCAL_PACKAGE
-    # The portable layout is intentionally updated in place.  The .bak file
-    # remains the immutable source/rollback copy.
-    default_output = LOCAL_PACKAGE
-else:
-    NEW_ORIGINAL = ROOT / "Sai2_2026" / "sai2.exe.1785683660.bak"
-    OFFICIAL_PACKAGE = ROOT / "Sai2_2026"
-    default_output = ROOT / "Sai2_2026_简体中文"
-OUTPUT = Path(os.environ["SAI2_ZH_OUTPUT"]) if os.environ.get("SAI2_ZH_OUTPUT") else default_output
-
-README_TEMPLATE = first_existing(
-    SCRIPT_DIR / "汉化说明模板.txt",
-    REPO_ROOT / "tools" / "汉化说明模板.txt",
-)
-TRANSLATION_JSON = first_existing(
-    SCRIPT_DIR / "translation.json",
-    REPO_ROOT / "tools" / "translation.json",
-)
-
-EXPECTED_HASHES = {
-    "2026.07.30 original": "11E5FCAA495F4859B772FE2BAF3C83C8522CE12F991950A97C849A237DAAC805",
-}
-
-# Raw file offsets and record counts.  Each locale record is three uint64s:
-# numeric id, UTF-16 key pointer, UTF-16 value pointer.
-NEW_JA_GROUPS = [(0x385ED8, 1471), (0x38E8D8, 247), (0x39C198, 14), (0x3AB3F8, 18), (0x3B3208, 101), (0x3CEFE8, 73)]
-NEW_EN_GROUPS = [(0x390018, 1471), (0x398A18, 217), (0x399E88, 3), (0x399EE8, 25), (0x3AB5C8, 18), (0x3B3B98, 101), (0x3CF6D8, 73)]
+APP_NAME = "SAI2 简体中文自动适配工具"
 UI_FONT_NAME = "Microsoft YaHei UI"
-UI_FONT_REFERENCES = [
-    # raw instruction offset, instruction RVA, expected opcode, original target RVA
-    (0x234877, 0x235477, b"\x48\x8D\x3D", 0x3CCA08),  # Meiryo UI
-    (0x23487E, 0x23547E, b"\x48\x8D\x05", 0x3CC9E8),  # MS UI Gothic
-]
-
+UI_FONT_SOURCES = ("Meiryo UI", "MS UI Gothic")
 KEY_RE = re.compile(r"[A-Za-z][A-Za-z0-9_]{2,}\Z")
+VERSION_RE = re.compile(r"Alpha\.(\d{4}\.\d{2}\.\d{2})")
+JAPANESE_RE = re.compile(r"[\u3040-\u30ff\u3400-\u9fff]")
+
+
+def app_dir() -> Path:
+    return Path(sys.executable).resolve().parent if getattr(sys, "frozen", False) else Path(__file__).resolve().parent
+
+
+def resource_path(name: str) -> Path:
+    base = Path(getattr(sys, "_MEIPASS", app_dir()))
+    bundled = base / name
+    return bundled if bundled.exists() else app_dir() / name
+
+
 def sha256(path: Path) -> str:
-    h = hashlib.sha256()
-    with path.open("rb") as f:
-        for chunk in iter(lambda: f.read(1024 * 1024), b""):
-            h.update(chunk)
-    return h.hexdigest().upper()
+    digest = hashlib.sha256()
+    with path.open("rb") as stream:
+        for chunk in iter(lambda: stream.read(1024 * 1024), b""):
+            digest.update(chunk)
+    return digest.hexdigest().upper()
 
 
 class PEImage:
@@ -93,203 +51,290 @@ class PEImage:
         self.path = path
         self.data = bytearray(path.read_bytes())
         if self.data[:2] != b"MZ":
-            raise ValueError(f"Not a PE file: {path}")
+            raise ValueError(f"不是有效的 Windows PE 文件：{path}")
         self.pe_offset = struct.unpack_from("<I", self.data, 0x3C)[0]
         if self.data[self.pe_offset:self.pe_offset + 4] != b"PE\0\0":
-            raise ValueError(f"Invalid PE signature: {path}")
-        number_of_sections = struct.unpack_from("<H", self.data, self.pe_offset + 6)[0]
-        optional_size = struct.unpack_from("<H", self.data, self.pe_offset + 20)[0]
+            raise ValueError(f"PE 签名无效：{path}")
         self.number_of_sections_offset = self.pe_offset + 6
-        self.number_of_sections = number_of_sections
+        self.number_of_sections = struct.unpack_from("<H", self.data, self.number_of_sections_offset)[0]
+        optional_size = struct.unpack_from("<H", self.data, self.pe_offset + 20)[0]
         self.optional_offset = self.pe_offset + 24
-        magic = struct.unpack_from("<H", self.data, self.optional_offset)[0]
-        if magic != 0x20B:
-            raise ValueError("Only 64-bit PE32+ files are supported")
+        if struct.unpack_from("<H", self.data, self.optional_offset)[0] != 0x20B:
+            raise ValueError("仅支持 64 位 SAI2")
         self.image_base = struct.unpack_from("<Q", self.data, self.optional_offset + 24)[0]
         self.checksum_offset = self.optional_offset + 64
-        section_offset = self.optional_offset + optional_size
-        self.section_table_offset = section_offset
-        self.sections = []
-        for index in range(number_of_sections):
-            off = section_offset + index * 40
-            name = bytes(self.data[off:off + 8]).rstrip(b"\0").decode("ascii", "replace")
-            virtual_size, rva, raw_size, raw_offset = struct.unpack_from("<IIII", self.data, off + 8)
+        self.section_table_offset = self.optional_offset + optional_size
+        self.sections: list[tuple[str, int, int, int, int]] = []
+        for index in range(self.number_of_sections):
+            offset = self.section_table_offset + index * 40
+            name = bytes(self.data[offset:offset + 8]).rstrip(b"\0").decode("ascii", "replace")
+            virtual_size, rva, raw_size, raw_offset = struct.unpack_from("<IIII", self.data, offset + 8)
             self.sections.append((name, rva, virtual_size, raw_offset, raw_size))
 
     @staticmethod
     def _align(value: int, alignment: int) -> int:
         return (value + alignment - 1) // alignment * alignment
 
-    def add_readonly_data_section(self, name: bytes, payload: bytes) -> int:
-        if not 1 <= len(name) <= 8:
-            raise ValueError("PE section name must contain 1 to 8 bytes")
-        file_alignment = struct.unpack_from("<I", self.data, self.optional_offset + 36)[0]
-        section_alignment = struct.unpack_from("<I", self.data, self.optional_offset + 32)[0]
-        size_of_headers = struct.unpack_from("<I", self.data, self.optional_offset + 60)[0]
-        header_offset = self.section_table_offset + self.number_of_sections * 40
-        if header_offset + 40 > size_of_headers:
-            raise ValueError("No room for another PE section header")
-        if any(self.data[header_offset:header_offset + 40]):
-            raise ValueError("The next PE section header slot is not empty")
-
-        last_end = max(rva + max(virtual_size, raw_size) for _n, rva, virtual_size, _o, raw_size in self.sections)
-        new_rva = self._align(last_end, section_alignment)
-        new_raw_offset = self._align(len(self.data), file_alignment)
-        new_raw_size = self._align(len(payload), file_alignment)
-        if new_raw_offset > len(self.data):
-            self.data.extend(b"\0" * (new_raw_offset - len(self.data)))
-        self.data.extend(payload)
-        self.data.extend(b"\0" * (new_raw_size - len(payload)))
-
-        characteristics = 0x40000040  # IMAGE_SCN_CNT_INITIALIZED_DATA | IMAGE_SCN_MEM_READ
-        section_header = struct.pack(
-            "<8sIIIIIIHHI",
-            name.ljust(8, b"\0"), len(payload), new_rva, new_raw_size, new_raw_offset,
-            0, 0, 0, 0, characteristics,
-        )
-        self.data[header_offset:header_offset + 40] = section_header
-        self.number_of_sections += 1
-        struct.pack_into("<H", self.data, self.number_of_sections_offset, self.number_of_sections)
-        initialized_size = struct.unpack_from("<I", self.data, self.optional_offset + 8)[0]
-        struct.pack_into("<I", self.data, self.optional_offset + 8, initialized_size + new_raw_size)
-        size_of_image = self._align(new_rva + len(payload), section_alignment)
-        struct.pack_into("<I", self.data, self.optional_offset + 56, size_of_image)
-        self.sections.append((name.decode("ascii"), new_rva, len(payload), new_raw_offset, new_raw_size))
-        return new_rva
+    def has_section(self, name: str) -> bool:
+        return any(section[0] == name for section in self.sections)
 
     def va_to_offset(self, va: int) -> int:
         rva = va - self.image_base
         for _name, section_rva, virtual_size, raw_offset, raw_size in self.sections:
             if section_rva <= rva < section_rva + max(virtual_size, raw_size):
                 result = raw_offset + rva - section_rva
-                if not 0 <= result < len(self.data):
-                    break
-                return result
-        raise ValueError(f"VA 0x{va:X} is outside mapped sections")
+                if 0 <= result < len(self.data):
+                    return result
+        raise ValueError(f"地址 0x{va:X} 不在 PE 映射区内")
 
-    def utf16(self, va: int, limit: int = 16384) -> tuple[str, int]:
-        off = self.va_to_offset(va)
-        end = off
-        while end + 1 < len(self.data) and end - off < limit:
+    def offset_to_rva(self, offset: int) -> int:
+        for _name, section_rva, _virtual_size, raw_offset, raw_size in self.sections:
+            if raw_offset <= offset < raw_offset + raw_size:
+                return section_rva + offset - raw_offset
+        raise ValueError(f"文件偏移 0x{offset:X} 不在 PE 映射区内")
+
+    def utf16(self, va: int, cache: dict[int, str] | None = None, limit: int = 16384) -> str:
+        if cache is not None and va in cache:
+            return cache[va]
+        offset = self.va_to_offset(va)
+        end = offset
+        while end + 1 < len(self.data) and end - offset < limit:
             if self.data[end:end + 2] == b"\0\0":
-                return bytes(self.data[off:end]).decode("utf-16le"), off
+                result = bytes(self.data[offset:end]).decode("utf-16le")
+                if cache is not None:
+                    cache[va] = result
+                return result
             end += 2
-        raise ValueError(f"Unterminated UTF-16 string at VA 0x{va:X}")
+        raise ValueError(f"UTF-16 字符串未终止：0x{va:X}")
 
-    def records(self, groups: list[tuple[int, int]]) -> list[dict]:
-        result = []
-        for start, count in groups:
-            for index in range(count):
-                off = start + index * 24
-                ident, key_va, value_va = struct.unpack_from("<QQQ", self.data, off)
-                key, _ = self.utf16(key_va)
-                value, value_off = self.utf16(value_va)
-                if not KEY_RE.fullmatch(key):
-                    raise ValueError(f"Invalid locale key at 0x{off:X}: {key!r}")
-                result.append({
-                    "record_offset": off,
-                    "id": ident,
-                    "key": key,
-                    "value": value,
-                    "value_va": value_va,
-                    "value_offset": value_off,
-                })
-        return result
+    def locale_record(self, offset: int, cache: dict[int, str]) -> dict | None:
+        try:
+            ident, key_va, value_va = struct.unpack_from("<QQQ", self.data, offset)
+            key = self.utf16(key_va, cache)
+            if not KEY_RE.fullmatch(key):
+                return None
+            return {
+                "record_offset": offset,
+                "id": ident,
+                "key": key,
+                "value": self.utf16(value_va, cache),
+            }
+        except (ValueError, UnicodeError, struct.error):
+            return None
 
+    def discover_record_runs(self) -> list[list[dict]]:
+        """Discover contiguous arrays of (id, key pointer, value pointer)."""
+        cache: dict[int, str] = {}
+        valid: dict[int, dict] = {}
+        scan_sections = [section for section in self.sections if section[0] in (".rdata", ".data")]
+        for _name, _rva, _virtual_size, raw_offset, raw_size in scan_sections:
+            for offset in range(self._align(raw_offset, 8), raw_offset + raw_size - 23, 8):
+                record = self.locale_record(offset, cache)
+                if record is not None:
+                    valid[offset] = record
+        runs: list[list[dict]] = []
+        for offset in sorted(valid):
+            if offset - 24 in valid:
+                continue
+            run = []
+            cursor = offset
+            while cursor in valid:
+                run.append(valid[cursor])
+                cursor += 24
+            if len(run) >= 3:
+                runs.append(run)
+        return runs
 
-def load_translation_memory(records: list[dict]) -> list[str]:
-    """Load and validate the complete translation.json for this exact build."""
-    if TRANSLATION_JSON is None or not TRANSLATION_JSON.exists():
-        raise FileNotFoundError(
-            f"找不到 {TRANSLATION_JSON or 'translation.json'}；没有翻译库时不会运行。"
+    def find_utf16_rip_references(self, text: str) -> list[tuple[int, int]]:
+        needle = text.encode("utf-16le") + b"\0\0"
+        string_offset = self.data.find(needle)
+        if string_offset < 0:
+            return []
+        target_rva = self.offset_to_rva(string_offset)
+        matches = []
+        text_sections = [section for section in self.sections if section[0] in (".text", ".code")]
+        for _name, _rva, _virtual_size, raw_start, raw_size in text_sections:
+            for raw_offset in range(raw_start, raw_start + raw_size - 7):
+                if bytes(self.data[raw_offset:raw_offset + 3]) not in (b"\x48\x8D\x3D", b"\x48\x8D\x05"):
+                    continue
+                instruction_rva = self.offset_to_rva(raw_offset)
+                displacement = struct.unpack_from("<i", self.data, raw_offset + 3)[0]
+                if instruction_rva + 7 + displacement == target_rva:
+                    matches.append((raw_offset, instruction_rva))
+        return matches
+
+    def add_readonly_data_section(self, name: bytes, payload: bytes) -> int:
+        file_alignment = struct.unpack_from("<I", self.data, self.optional_offset + 36)[0]
+        section_alignment = struct.unpack_from("<I", self.data, self.optional_offset + 32)[0]
+        size_of_headers = struct.unpack_from("<I", self.data, self.optional_offset + 60)[0]
+        header_offset = self.section_table_offset + self.number_of_sections * 40
+        if header_offset + 40 > size_of_headers or any(self.data[header_offset:header_offset + 40]):
+            raise ValueError("PE 头没有可用的新节表空间")
+        last_end = max(rva + max(virtual_size, raw_size) for _n, rva, virtual_size, _o, raw_size in self.sections)
+        new_rva = self._align(last_end, section_alignment)
+        new_raw_offset = self._align(len(self.data), file_alignment)
+        new_raw_size = self._align(len(payload), file_alignment)
+        self.data.extend(b"\0" * (new_raw_offset - len(self.data)))
+        self.data.extend(payload)
+        self.data.extend(b"\0" * (new_raw_size - len(payload)))
+        header = struct.pack(
+            "<8sIIIIIIHHI", name.ljust(8, b"\0"), len(payload), new_rva,
+            new_raw_size, new_raw_offset, 0, 0, 0, 0, 0x40000040,
         )
+        self.data[header_offset:header_offset + 40] = header
+        self.number_of_sections += 1
+        struct.pack_into("<H", self.data, self.number_of_sections_offset, self.number_of_sections)
+        initialized_size = struct.unpack_from("<I", self.data, self.optional_offset + 8)[0]
+        struct.pack_into("<I", self.data, self.optional_offset + 8, initialized_size + new_raw_size)
+        struct.pack_into("<I", self.data, self.optional_offset + 56, self._align(new_rva + len(payload), section_alignment))
+        self.sections.append((name.decode("ascii"), new_rva, len(payload), new_raw_offset, new_raw_size))
+        return new_rva
+
+
+def load_translation_memory(path: Path | None = None) -> tuple[dict[str, list[dict]], dict]:
+    source = path or resource_path("translation.json")
     try:
-        data = json.loads(TRANSLATION_JSON.read_text(encoding="utf-8"))
+        data = json.loads(source.read_text(encoding="utf-8"))
     except (OSError, UnicodeError, json.JSONDecodeError) as exc:
-        raise RuntimeError(f"无法读取翻译库 {TRANSLATION_JSON}。") from exc
-    if not isinstance(data, dict) or data.get("source_sha256") != EXPECTED_HASHES["2026.07.30 original"]:
-        raise ValueError("translation.json 不是 2026.07.30 对应的翻译库。")
-    items = data.get("translations")
-    if not isinstance(items, list) or len(items) != len(records):
-        raise ValueError(
-            f"translation.json 词条数量不匹配：需要 {len(records)} 条，实际 {len(items) if isinstance(items, list) else 0} 条。"
+        raise RuntimeError(f"无法读取翻译库：{source}") from exc
+    items = data.get("translations") if isinstance(data, dict) else None
+    if not isinstance(items, list):
+        raise ValueError("translation.json 缺少 translations 数组")
+    memory: dict[str, list[dict]] = {}
+    for item in items:
+        if isinstance(item, dict) and isinstance(item.get("key"), str) and isinstance(item.get("zh_cn"), str):
+            memory.setdefault(item["key"], []).append(item)
+    if not memory:
+        raise ValueError("翻译库为空")
+    return memory, data
+
+
+def choose_translation(record: dict, memory: dict[str, list[dict]]) -> tuple[dict | None, str]:
+    candidates = memory.get(record["key"], [])
+    if not candidates:
+        return None, "new"
+    exact = [item for item in candidates if item.get("ja") == record["value"]]
+    if exact:
+        return exact[0], "exact"
+    if record["key"] == "App_Title":
+        return candidates[0], "version_title"
+    translations = {item.get("zh_cn") for item in candidates if item.get("zh_cn")}
+    if len(candidates) == 1 or len(translations) == 1:
+        return candidates[0], "source_changed"
+    return None, "ambiguous"
+
+
+def select_japanese_records(image: PEImage, memory: dict[str, list[dict]]) -> tuple[list[dict], list[dict]]:
+    selected_runs = []
+    diagnostics = []
+    for run in image.discover_record_runs():
+        known = [record for record in run if record["key"] in memory]
+        ja_exact = sum(any(item.get("ja") == r["value"] for item in memory[r["key"]]) for r in known)
+        en_exact = sum(any(item.get("en") == r["value"] for item in memory[r["key"]]) for r in known)
+        japanese_values = sum(bool(JAPANESE_RE.search(r["value"])) for r in run)
+        known_density = len(known) / len(run)
+        is_japanese = (
+            len(known) >= 3 and known_density >= 0.25 and ja_exact > en_exact
+        ) or (
+            japanese_values >= max(2, len(run) // 4) and (known_density >= 0.1 or len(known) == 0)
         )
-    targets = []
-    for index, (record, item) in enumerate(zip(records, items), start=1):
-        if not isinstance(item, dict):
-            raise ValueError(f"translation.json 第 {index} 条格式错误。")
-        if item.get("key") != record["key"] or item.get("ja") != record["value"]:
-            raise ValueError(f"translation.json 第 {index} 条与当前 sai2.exe 不匹配。")
-        target = item.get("zh_cn")
-        if not isinstance(target, str) or not target:
-            raise ValueError(f"translation.json 第 {index} 条缺少 zh_cn 翻译。")
-        targets.append(target)
-    return targets
+        diagnostics.append({
+            "offset": f"0x{run[0]['record_offset']:X}", "records": len(run),
+            "known": len(known), "ja_exact": ja_exact, "en_exact": en_exact,
+            "japanese_values": japanese_values, "selected": is_japanese,
+        })
+        if is_japanese:
+            selected_runs.append(run)
+    records_by_offset = {
+        record["record_offset"]: record for run in selected_runs for record in run
+    }
+    records = [records_by_offset[offset] for offset in sorted(records_by_offset)]
+    if len(records) < 100:
+        raise ValueError(f"自动识别到的日文词条过少（{len(records)} 条），已停止以保护 EXE")
+    return records, diagnostics
 
 
-def build_translation_inputs():
-    if not NEW_ORIGINAL or not NEW_ORIGINAL.exists():
-        raise FileNotFoundError("找不到 2026.07.30 原版备份 sai2.exe.1785683660.bak")
-    if not OFFICIAL_PACKAGE or not OFFICIAL_PACKAGE.exists():
-        raise FileNotFoundError("找不到 SAI2 文件夹或官方文件包")
-    new_original = PEImage(NEW_ORIGINAL)
-    new_ja = new_original.records(NEW_JA_GROUPS)
-    new_en = new_original.records(NEW_EN_GROUPS)
-    targets = load_translation_memory(new_ja)
-    return new_original, new_ja, new_en, targets
+def version_from_records(records: list[dict]) -> str:
+    title = next((record["value"] for record in records if record["key"] == "App_Title"), "")
+    match = VERSION_RE.search(title)
+    return match.group(1) if match else "unknown"
+
+
+def analyze(source: Path, translation_path: Path | None = None) -> dict:
+    image = PEImage(source)
+    if image.has_section(".zhcn"):
+        raise ValueError("该 EXE 已经汉化，请选择原版 EXE 或原版备份")
+    memory, metadata = load_translation_memory(translation_path)
+    records, runs = select_japanese_records(image, memory)
+    record_keys = {record["key"] for record in records}
+    changed_source = []
+    new_records = []
+    ambiguous_records = []
+    translated = 0
+    for record in records:
+        item, match_type = choose_translation(record, memory)
+        if match_type == "new":
+            new_records.append({"key": record["key"], "ja": record["value"]})
+            continue
+        if match_type == "ambiguous":
+            ambiguous_records.append({"key": record["key"], "ja": record["value"]})
+            continue
+        translated += 1
+        if match_type == "source_changed" and item is not None:
+            changed_source.append({
+                "key": record["key"], "old_ja": item.get("ja", ""),
+                "new_ja": record["value"], "current_zh_cn": item.get("zh_cn", ""),
+            })
+    return {
+        "source": str(source), "source_sha256": sha256(source),
+        "version": version_from_records(records), "records": records,
+        "record_count": len(records), "translated_count": translated,
+        "new_records": new_records, "changed_source": changed_source,
+        "ambiguous_records": ambiguous_records,
+        "missing_old_keys": sorted(set(memory) - record_keys),
+        "runs": runs, "translation_version": metadata.get("source_version", "unknown"),
+    }
 
 
 def calculate_pe_checksum(data: bytearray, checksum_offset: int) -> int:
     temp = bytearray(data)
     temp[checksum_offset:checksum_offset + 4] = b"\0\0\0\0"
     total = 0
-    length = len(temp)
-    for offset in range(0, length - 1, 2):
+    for offset in range(0, len(temp) - 1, 2):
         total += temp[offset] | (temp[offset + 1] << 8)
         total = (total & 0xFFFF) + (total >> 16)
-    if length & 1:
+    if len(temp) & 1:
         total += temp[-1]
         total = (total & 0xFFFF) + (total >> 16)
     total = (total & 0xFFFF) + (total >> 16)
-    return (total + length) & 0xFFFFFFFF
+    return (total + len(temp)) & 0xFFFFFFFF
 
 
-def write_executable(path: Path, data: bytes) -> None:
-    try:
-        path.write_bytes(data)
-    except PermissionError as exc:
-        raise RuntimeError(f"无法写入 {path}；请先完全退出 SAI2 后再运行脚本。") from exc
-
-
-def main() -> int:
-    for path, expected in [(NEW_ORIGINAL, EXPECTED_HASHES["2026.07.30 original"])] :
-        if path is None or not path.exists():
-            raise FileNotFoundError(path or "2026.07.30 原版备份")
-        actual = sha256(path)
-        if actual != expected:
-            raise ValueError(f"Unexpected source hash for {path}: {actual}")
-
-    image, records, _english_records, translation_targets = build_translation_inputs()
-
-    proposals = []
-    for record, target in zip(records, translation_targets):
-        source = record["value"]
-        item = {**record, "translation": target, "origin": "translation.json"}
-        proposals.append(item)
-
-    changed = [proposal for proposal in proposals if proposal["translation"] != proposal["value"]]
-    unique_targets = list(dict.fromkeys(proposal["translation"] for proposal in changed))
-    section_strings = unique_targets + ([UI_FONT_NAME] if UI_FONT_NAME not in unique_targets else [])
-
+def build_patch(source: Path, output: Path, report_path: Path, translation_path: Path | None = None) -> dict:
+    result = analyze(source, translation_path)
+    memory, _metadata = load_translation_memory(translation_path)
+    image = PEImage(source)
     original_data = bytes(image.data)
     original_length = len(original_data)
-    string_payload = bytearray()
-    string_offsets: dict[str, int] = {}
-    for target in section_strings:
-        string_offsets[target] = len(string_payload)
-        string_payload.extend(target.encode("utf-16le") + b"\0\0")
-    new_section_rva = image.add_readonly_data_section(b".zhcn", bytes(string_payload))
-
+    proposals = []
+    for record in result["records"]:
+        item, _match_type = choose_translation(record, memory)
+        if item is None:
+            continue
+        target = record["value"] if record["key"] == "App_Title" else item.get("zh_cn")
+        if isinstance(target, str) and target and target != record["value"]:
+            proposals.append((record, target))
+    unique_targets = list(dict.fromkeys(target for _record, target in proposals))
+    section_strings = unique_targets + ([UI_FONT_NAME] if UI_FONT_NAME not in unique_targets else [])
+    payload = bytearray()
+    string_offsets = {}
+    for text in section_strings:
+        string_offsets[text] = len(payload)
+        payload.extend(text.encode("utf-16le") + b"\0\0")
+    font_references = [
+        reference for font in UI_FONT_SOURCES for reference in image.find_utf16_rip_references(font)
+    ]
+    new_section_rva = image.add_readonly_data_section(b".zhcn", bytes(payload))
     allowed_ranges = [
         (image.number_of_sections_offset, image.number_of_sections_offset + 2),
         (image.optional_offset + 8, image.optional_offset + 12),
@@ -297,63 +342,194 @@ def main() -> int:
         (image.section_table_offset + (image.number_of_sections - 1) * 40,
          image.section_table_offset + image.number_of_sections * 40),
     ]
-    for proposal in changed:
-        pointer_offset = proposal["record_offset"] + 16
-        target_va = image.image_base + new_section_rva + string_offsets[proposal["translation"]]
+    for record, target in proposals:
+        pointer_offset = record["record_offset"] + 16
+        target_va = image.image_base + new_section_rva + string_offsets[target]
         struct.pack_into("<Q", image.data, pointer_offset, target_va)
         allowed_ranges.append((pointer_offset, pointer_offset + 8))
-
     font_va = image.image_base + new_section_rva + string_offsets[UI_FONT_NAME]
-    for raw_offset, instruction_rva, opcode, expected_target_rva in UI_FONT_REFERENCES:
-        if bytes(image.data[raw_offset:raw_offset + 3]) != opcode:
-            raise ValueError(f"Unexpected UI font reference opcode at 0x{raw_offset:X}")
-        old_displacement = struct.unpack_from("<i", image.data, raw_offset + 3)[0]
-        old_target_rva = instruction_rva + 7 + old_displacement
-        if old_target_rva != expected_target_rva:
-            raise ValueError(f"Unexpected UI font target at 0x{raw_offset:X}: 0x{old_target_rva:X}")
-        new_displacement = font_va - (image.image_base + instruction_rva + 7)
-        struct.pack_into("<i", image.data, raw_offset + 3, new_displacement)
+    for raw_offset, instruction_rva in font_references:
+        displacement = font_va - (image.image_base + instruction_rva + 7)
+        struct.pack_into("<i", image.data, raw_offset + 3, displacement)
         allowed_ranges.append((raw_offset + 3, raw_offset + 7))
-
     struct.pack_into("<I", image.data, image.checksum_offset, 0)
     checksum = calculate_pe_checksum(image.data, image.checksum_offset)
     struct.pack_into("<I", image.data, image.checksum_offset, checksum)
     allowed_ranges.append((image.checksum_offset, image.checksum_offset + 4))
-
     for index, (before, after) in enumerate(zip(original_data, image.data[:original_length])):
         if before != after and not any(start <= index < end for start, end in allowed_ranges):
-            raise AssertionError(f"Unexpected modified byte at file offset 0x{index:X}")
+            raise AssertionError(f"检测到非预期修改：文件偏移 0x{index:X}")
+    try:
+        output.write_bytes(image.data)
+    except PermissionError as exc:
+        raise RuntimeError("无法写入 sai2.exe，请先完全退出 SAI2") from exc
+    report = {key: value for key, value in result.items() if key != "records"}
+    report.update({
+        "output": str(output), "output_sha256": sha256(output),
+        "patched_records": len(proposals), "unique_chinese_strings": len(unique_targets),
+        "font_references_patched": len(font_references),
+    })
+    report_path.write_text(json.dumps(report, ensure_ascii=False, indent=2), encoding="utf-8")
+    return report
 
-    in_place = OUTPUT.resolve() == OFFICIAL_PACKAGE.resolve()
-    if in_place:
-        # Build and validate in memory first; only now replace the executable.
-        write_executable(OUTPUT / "sai2.exe", image.data)
-    else:
-        if OUTPUT.exists():
-            shutil.rmtree(OUTPUT)
-        shutil.copytree(OFFICIAL_PACKAGE, OUTPUT)
-        write_executable(OUTPUT / "sai2.exe", image.data)
-    if README_TEMPLATE and README_TEMPLATE.exists():
-        shutil.copy2(README_TEMPLATE, OUTPUT / "汉化说明.txt")
-    else:
-        (OUTPUT / "汉化说明.txt").write_text(
-            "PaintTool SAI 2 2026.07.30 简体中文补丁\n"
-            "本补丁仅替换界面文字和界面字体，原版备份为 sai2.exe.1785683660.bak。\n",
-            encoding="utf-8",
-        )
-    ini_path = OUTPUT / "sai2.ini"
+
+def find_source(folder: Path) -> tuple[Path, Path]:
+    live = folder / "sai2.exe"
+    backup = folder / "sai2.exe.original.bak"
+    if backup.exists():
+        return backup, live
+    legacy = sorted(folder.glob("sai2.exe.*.bak"))
+    if legacy:
+        return legacy[0], live
+    if live.exists():
+        return live, live
+    raise FileNotFoundError(f"所选文件夹中没有 sai2.exe：{folder}")
+
+
+def patch_folder(folder: Path, log=lambda _message: None) -> dict:
+    source, output = find_source(folder)
+    log(f"分析原版：{source.name}")
+    result = analyze(source)
+    log(f"识别版本：{result['version']}，日文词条：{result['record_count']}")
+    log(f"可翻译：{result['translated_count']}，新增：{len(result['new_records'])}，原文变化：{len(result['changed_source'])}，歧义：{len(result['ambiguous_records'])}")
+    backup = folder / "sai2.exe.original.bak"
+    if not backup.exists():
+        shutil.copy2(source, backup)
+        source = backup
+        log(f"已创建原版备份：{backup.name}")
+    report_path = folder / "sai2_zh_adaptation_report.json"
+    report = build_patch(source, output, report_path)
+    ini_path = folder / "sai2.ini"
     if ini_path.exists():
-        ini_bytes = ini_path.read_bytes()
-        ini_encoding = "utf-16" if ini_bytes.startswith((b"\xff\xfe", b"\xfe\xff")) else "utf-8-sig"
-        ini = ini_bytes.decode(ini_encoding)
-        ini = re.sub(r"(?m)^lang\s*=\s*en\s*$", "lang = ja", ini, count=1)
-        ini_path.write_text(ini, encoding=ini_encoding, newline="\r\n")
+        raw = ini_path.read_bytes()
+        encoding = "utf-16" if raw.startswith((b"\xff\xfe", b"\xfe\xff")) else "utf-8-sig"
+        ini = raw.decode(encoding)
+        ini = re.sub(r"(?m)^lang\s*=\s*(?:en|ja)\s*$", "lang = ja", ini, count=1)
+        ini_path.write_text(ini, encoding=encoding, newline="\r\n")
+    log(f"汉化完成：{report['patched_records']} 条，报告：{report_path.name}")
+    return report
 
-    output_sha256 = sha256(OUTPUT / "sai2.exe")
-    print(f"Built: {OUTPUT}")
-    print(f"Patched locale records: {len(changed)}")
-    print(f"Unique Chinese strings: {len(unique_targets)}")
-    print(f"Output SHA-256: {output_sha256}")
+
+def restore_folder(folder: Path) -> None:
+    backup = folder / "sai2.exe.original.bak"
+    if not backup.exists():
+        raise FileNotFoundError("没有找到 sai2.exe.original.bak")
+    shutil.copy2(backup, folder / "sai2.exe")
+
+
+def run_gui() -> int:
+    import tkinter as tk
+    from tkinter import filedialog, messagebox, ttk
+
+    root = tk.Tk()
+    root.title(APP_NAME)
+    root.geometry("720x500")
+    root.minsize(620, 420)
+    try:
+        root.tk.call("tk", "scaling", 1.25)
+    except tk.TclError:
+        pass
+    folder_var = tk.StringVar(value=str(app_dir()))
+    status_var = tk.StringVar(value="请选择包含 sai2.exe 的文件夹")
+
+    frame = ttk.Frame(root, padding=18)
+    frame.pack(fill="both", expand=True)
+    ttk.Label(frame, text=APP_NAME, font=("Microsoft YaHei UI", 18, "bold")).pack(anchor="w")
+    ttk.Label(frame, text="自动识别未知版本的语言表和字体引用；新增词条会保留原文并生成报告。", wraplength=680).pack(anchor="w", pady=(5, 16))
+    row = ttk.Frame(frame)
+    row.pack(fill="x")
+    entry = ttk.Entry(row, textvariable=folder_var)
+    entry.pack(side="left", fill="x", expand=True)
+
+    def choose_folder():
+        selected = filedialog.askdirectory(initialdir=folder_var.get() or str(app_dir()))
+        if selected:
+            folder_var.set(selected)
+
+    ttk.Button(row, text="浏览…", command=choose_folder).pack(side="left", padx=(8, 0))
+    log_box = tk.Text(frame, height=15, wrap="word", state="disabled", font=("Consolas", 10))
+    log_box.pack(fill="both", expand=True, pady=14)
+
+    def log(message: str):
+        def append():
+            log_box.configure(state="normal")
+            log_box.insert("end", message + "\n")
+            log_box.see("end")
+            log_box.configure(state="disabled")
+            status_var.set(message)
+        root.after(0, append)
+
+    buttons = ttk.Frame(frame)
+    buttons.pack(fill="x")
+
+    def background(action):
+        for button in action_buttons:
+            button.configure(state="disabled")
+        def worker():
+            try:
+                action(Path(folder_var.get()).resolve())
+            except Exception as exc:
+                log(f"错误：{exc}")
+                root.after(0, lambda: messagebox.showerror(APP_NAME, str(exc)))
+            finally:
+                root.after(0, lambda: [button.configure(state="normal") for button in action_buttons])
+        threading.Thread(target=worker, daemon=True).start()
+
+    def do_analyze(folder: Path):
+        source, _output = find_source(folder)
+        result = analyze(source)
+        log(f"版本 {result['version']}；识别 {result['record_count']} 条；可翻译 {result['translated_count']} 条")
+        log(f"新增词条 {len(result['new_records'])} 条；原文变化 {len(result['changed_source'])} 条；歧义 {len(result['ambiguous_records'])} 条")
+
+    def do_patch(folder: Path):
+        report = patch_folder(folder, log)
+        root.after(0, lambda: messagebox.showinfo(APP_NAME, f"汉化完成！\n已替换 {report['patched_records']} 条界面文字。"))
+
+    def do_restore(folder: Path):
+        restore_folder(folder)
+        log("已从原版备份恢复 sai2.exe")
+        root.after(0, lambda: messagebox.showinfo(APP_NAME, "恢复完成"))
+
+    action_buttons = [
+        ttk.Button(buttons, text="检测版本", command=lambda: background(do_analyze)),
+        ttk.Button(buttons, text="开始汉化", command=lambda: background(do_patch)),
+        ttk.Button(buttons, text="恢复原版", command=lambda: background(do_restore)),
+    ]
+    for button in action_buttons:
+        button.pack(side="left", padx=(0, 8))
+    ttk.Label(buttons, textvariable=status_var).pack(side="right")
+    root.mainloop()
+    return 0
+
+
+def main() -> int:
+    if hasattr(sys.stdout, "reconfigure"):
+        sys.stdout.reconfigure(encoding="utf-8", errors="replace")
+    if hasattr(sys.stderr, "reconfigure"):
+        sys.stderr.reconfigure(encoding="utf-8", errors="replace")
+    parser = argparse.ArgumentParser(description=APP_NAME)
+    parser.add_argument("folder", nargs="?", type=Path, help="包含 sai2.exe 的目录")
+    parser.add_argument("--analyze", action="store_true", help="只分析，不修改")
+    parser.add_argument("--no-gui", action="store_true", help="使用命令行模式")
+    parser.add_argument("--ui-smoke-test", action="store_true", help=argparse.SUPPRESS)
+    args = parser.parse_args()
+    if args.ui_smoke_test:
+        import tkinter as tk
+        test_root = tk.Tk()
+        test_root.withdraw()
+        test_root.update()
+        test_root.destroy()
+        return 0
+    if not args.folder and not args.no_gui:
+        return run_gui()
+    folder = (args.folder or app_dir()).resolve()
+    if args.analyze:
+        source, _output = find_source(folder)
+        result = analyze(source)
+        printable = {key: value for key, value in result.items() if key != "records"}
+        print(json.dumps(printable, ensure_ascii=False, indent=2))
+    else:
+        patch_folder(folder, print)
     return 0
 
 
@@ -362,4 +538,6 @@ if __name__ == "__main__":
         raise SystemExit(main())
     except Exception as exc:
         print(f"ERROR: {exc}", file=sys.stderr)
+        if getattr(sys, "frozen", False):
+            traceback.print_exc()
         raise
