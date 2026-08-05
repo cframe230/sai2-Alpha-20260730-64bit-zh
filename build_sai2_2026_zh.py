@@ -22,10 +22,7 @@ import traceback
 
 APP_NAME = "SAI2简中翻译工具"
 UI_FONT_SOURCES = ("Meiryo UI", "MS UI Gothic")
-FONT_PROFILES = {
-    "1k": ("1K及以下", "Microsoft YaHei UI"),
-    "2k": ("2K及以上", "Microsoft YaHei"),
-}
+UI_FONT_NAME = "Microsoft YaHei UI"
 KEY_RE = re.compile(r"[A-Za-z][A-Za-z0-9_]{2,}\Z")
 VERSION_RE = re.compile(r"(?:Alpha|Preview)\.(\d{4}\.\d{2}\.\d{2}[a-z]?)", re.IGNORECASE)
 JAPANESE_RE = re.compile(r"[\u3040-\u30ff\u3400-\u9fff]")
@@ -242,6 +239,62 @@ class PEImage:
                     matches.append((raw_offset, instruction_rva))
         return matches
 
+    def create_font_quality_blocks(self) -> list[int]:
+        """Locate the conditional LOGFONTW.lfQuality block used by font creation."""
+        import_directory = self.optional_offset + 112 + 8
+        import_rva, import_size = struct.unpack_from("<II", self.data, import_directory)
+        if not import_rva or not import_size:
+            return []
+        descriptor = self.va_to_offset(self.image_base + import_rva)
+        iat_rva = None
+        while descriptor + 20 <= len(self.data):
+            original_thunk, _time, _forwarder, dll_rva, first_thunk = struct.unpack_from("<IIIII", self.data, descriptor)
+            if not any((original_thunk, dll_rva, first_thunk)):
+                break
+            dll_offset = self.va_to_offset(self.image_base + dll_rva)
+            dll_end = self.data.find(b"\0", dll_offset)
+            dll_name = bytes(self.data[dll_offset:dll_end]).decode("ascii", "replace").lower()
+            if dll_name == "gdi32.dll":
+                thunk_rva = original_thunk or first_thunk
+                thunk_offset = self.va_to_offset(self.image_base + thunk_rva)
+                index = 0
+                while True:
+                    entry = struct.unpack_from("<Q", self.data, thunk_offset + index * 8)[0]
+                    if not entry:
+                        break
+                    if not entry >> 63:
+                        name_offset = self.va_to_offset(self.image_base + entry) + 2
+                        name_end = self.data.find(b"\0", name_offset)
+                        if bytes(self.data[name_offset:name_end]) == b"CreateFontIndirectW":
+                            iat_rva = first_thunk + index * 8
+                            break
+                    index += 1
+            if iat_rva is not None:
+                break
+            descriptor += 20
+        if iat_rva is None:
+            return []
+        result = []
+        quality_block = bytes.fromhex(
+            "0F BA E7 0C 73 06 C6 40 22 04 EB 0A "
+            "0F BA E7 0D 73 04 C6 40 22 03"
+        )
+        for name, _rva, _virtual_size, raw_start, raw_size in self.sections:
+            if name not in (".text", ".code"):
+                continue
+            for call_offset in range(raw_start, raw_start + raw_size - 6):
+                if self.data[call_offset:call_offset + 2] != b"\xff\x15":
+                    continue
+                call_rva = self.offset_to_rva(call_offset)
+                target_rva = call_rva + 6 + struct.unpack_from("<i", self.data, call_offset + 2)[0]
+                if target_rva != iat_rva:
+                    continue
+                start = max(raw_start, call_offset - 256)
+                quality_offset = self.data.find(quality_block, start, call_offset)
+                if quality_offset >= 0:
+                    result.append(quality_offset)
+        return list(dict.fromkeys(result))
+
     def add_readonly_data_section(self, name: bytes, payload: bytes) -> int:
         file_alignment = struct.unpack_from("<I", self.data, self.optional_offset + 36)[0]
         section_alignment = struct.unpack_from("<I", self.data, self.optional_offset + 32)[0]
@@ -448,6 +501,7 @@ def calculate_pe_checksum(data: bytearray, checksum_offset: int) -> int:
 def build_patch(
     source: Path, output: Path, report_path: Path,
     translation_path: Path | None = None, ui_font: str = "Microsoft YaHei UI",
+    clear_type: bool = True,
 ) -> dict:
     result = analyze(source, translation_path)
     memory, _metadata = load_translation_memory(translation_path)
@@ -484,6 +538,12 @@ def build_patch(
         displacement = font_va - (image.image_base + instruction_rva + 7)
         struct.pack_into("<i", image.data, raw_offset + 3, displacement)
         allowed_ranges.append((raw_offset + 3, raw_offset + 7))
+    quality_blocks = image.create_font_quality_blocks() if clear_type else []
+    conditional_quality_size = 22
+    force_cleartype = b"\xc6\x40\x22\x05" + b"\x90" * (conditional_quality_size - 4)
+    for quality_offset in quality_blocks:
+        image.data[quality_offset:quality_offset + conditional_quality_size] = force_cleartype
+        allowed_ranges.append((quality_offset, quality_offset + conditional_quality_size))
     struct.pack_into("<I", image.data, image.checksum_offset, 0)
     checksum = calculate_pe_checksum(image.data, image.checksum_offset)
     struct.pack_into("<I", image.data, image.checksum_offset, checksum)
@@ -500,6 +560,8 @@ def build_patch(
         "output": str(output), "output_sha256": sha256(output),
         "patched_records": len(proposals), "unique_chinese_strings": len(unique_targets),
         "font_references_patched": len(font_references), "ui_font": ui_font,
+        "clear_type_enabled": clear_type,
+        "font_quality_blocks_patched": len(quality_blocks),
     })
     report_path.write_text(json.dumps(report, ensure_ascii=False, indent=2), encoding="utf-8")
     return report
@@ -518,7 +580,10 @@ def find_source(folder: Path) -> tuple[Path, Path]:
     raise FileNotFoundError(f"所选文件夹中没有 sai2.exe：{folder}")
 
 
-def patch_folder(folder: Path, log=lambda _message: None, ui_font: str = "Microsoft YaHei UI") -> dict:
+def patch_folder(
+    folder: Path, log=lambda _message: None, ui_font: str = "Microsoft YaHei UI",
+    clear_type: bool = True,
+) -> dict:
     source, output = find_source(folder)
     log(f"分析原版：{source.name}")
     result = analyze(source)
@@ -530,7 +595,7 @@ def patch_folder(folder: Path, log=lambda _message: None, ui_font: str = "Micros
         source = backup
         log(f"已创建原版备份：{backup.name}")
     report_path = folder / "sai2_zh_adaptation_report.json"
-    report = build_patch(source, output, report_path, ui_font=ui_font)
+    report = build_patch(source, output, report_path, ui_font=ui_font, clear_type=clear_type)
     ini_path = folder / "sai2.ini"
     if ini_path.exists():
         raw = ini_path.read_bytes()
@@ -563,7 +628,6 @@ def run_gui() -> int:
         pass
     folder_var = tk.StringVar(value=str(app_dir()))
     status_var = tk.StringVar(value="请选择SAI2的文件夹")
-    font_profile_var = tk.StringVar(value="1k")
 
     frame = ttk.Frame(root, padding=18)
     frame.pack(fill="both", expand=True)
@@ -579,12 +643,7 @@ def run_gui() -> int:
             folder_var.set(selected)
 
     ttk.Button(row, text="浏览…", command=choose_folder).pack(side="left", padx=(8, 0))
-    font_frame = ttk.LabelFrame(frame, text="中文界面字体", padding=(12, 8))
-    font_frame.pack(fill="x", pady=(12, 0))
-    for profile, (label, font_name) in FONT_PROFILES.items():
-        ttk.Radiobutton(
-            font_frame, text=f"{label}：{font_name}", variable=font_profile_var, value=profile,
-        ).pack(side="left", padx=(0, 24))
+    ttk.Label(frame, text="界面字体：微软雅黑 UI", foreground="#555555").pack(anchor="w", pady=(10, 0))
     log_box = tk.Text(frame, height=15, wrap="word", state="disabled", font=("Consolas", 10))
     log_box.pack(fill="both", expand=True, pady=14)
 
@@ -620,10 +679,8 @@ def run_gui() -> int:
         log(f"跨版本匹配 {len(result['text_matched_records'])} 条；新增 {len(result['new_records'])} 条；原文变化 {len(result['changed_source'])} 条；歧义 {len(result['ambiguous_records'])} 条")
 
     def do_patch(folder: Path):
-        profile = font_profile_var.get()
-        font_name = FONT_PROFILES.get(profile, FONT_PROFILES["1k"])[1]
-        log(f"界面字体：{font_name}")
-        report = patch_folder(folder, log, font_name)
+        log(f"界面字体：{UI_FONT_NAME}（ClearType）")
+        report = patch_folder(folder, log, UI_FONT_NAME, True)
         root.after(0, lambda: messagebox.showinfo(APP_NAME, f"汉化完成！\n已替换 {report['patched_records']} 条界面文字。"))
 
     def do_restore(folder: Path):
@@ -652,7 +709,6 @@ def main() -> int:
     parser.add_argument("folder", nargs="?", type=Path, help="包含 sai2.exe 的目录")
     parser.add_argument("--analyze", action="store_true", help="只分析，不修改")
     parser.add_argument("--no-gui", action="store_true", help="使用命令行模式")
-    parser.add_argument("--font-profile", choices=FONT_PROFILES, default="1k", help="中文字体档位")
     parser.add_argument("--ui-smoke-test", action="store_true", help=argparse.SUPPRESS)
     args = parser.parse_args()
     if args.ui_smoke_test:
@@ -671,7 +727,7 @@ def main() -> int:
         printable = {key: value for key, value in result.items() if key != "records"}
         print(json.dumps(printable, ensure_ascii=False, indent=2))
     else:
-        patch_folder(folder, print, FONT_PROFILES[args.font_profile][1])
+        patch_folder(folder, print, UI_FONT_NAME, True)
     return 0
 
 
