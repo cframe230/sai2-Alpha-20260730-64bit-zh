@@ -20,12 +20,90 @@ import threading
 import traceback
 
 
-APP_NAME = "SAI2 简体中文自动适配工具"
-UI_FONT_NAME = "Microsoft YaHei UI"
+APP_NAME = "SAI2简中翻译工具"
 UI_FONT_SOURCES = ("Meiryo UI", "MS UI Gothic")
+FONT_PROFILES = {
+    "1k": ("1K及以下", "Microsoft YaHei UI"),
+    "2k": ("2K及以上", "Microsoft YaHei"),
+}
 KEY_RE = re.compile(r"[A-Za-z][A-Za-z0-9_]{2,}\Z")
-VERSION_RE = re.compile(r"Alpha\.(\d{4}\.\d{2}\.\d{2})")
+VERSION_RE = re.compile(r"(?:Alpha|Preview)\.(\d{4}\.\d{2}\.\d{2}[a-z]?)", re.IGNORECASE)
 JAPANESE_RE = re.compile(r"[\u3040-\u30ff\u3400-\u9fff]")
+
+# Keys/texts present in Preview.2026.07.02b but renamed or removed in later
+# Alpha builds.  Keeping them here also makes the bundled EXE self-contained.
+LEGACY_TRANSLATIONS = [
+    ("Error_SaiOldVer", "正式リリース前のテスト版のSAI Ver.1で作成されたSAI形式ファイルにはまだ対応していません。", "尚不支持由 SAI Ver.1 正式发布前测试版创建的 SAI 格式文件。"),
+    ("Error_FileCompoCount", "レイヤーの成分数が上限の 5 を超えています。", "图层的通道数超过上限 5。"),
+    ("Error_LayerMaxCount", "レイヤー数が上限の 8190 枚を超えました。", "图层数量超过上限 8190。"),
+    ("Bgmode_None", "指定しない", "不指定"),
+    ("Layer_NewCol", "新規レイヤー(カラー)", "新建图层（彩色）"),
+    ("Grid_SelVgFore", "グリッド面を緑軸回りに正順で変更", "绕绿轴依次切换网格面"),
+    ("Grid_SelVgInvt", "グリッド面を緑軸回りに逆順で変更", "绕绿轴反向切换网格面"),
+    ("Grid_SelVbFore", "グリッド面を青軸回りに正順で変更", "绕蓝轴依次切换网格面"),
+    ("Grid_SelVbInvt", "グリッド面を青軸回りに逆順で変更", "绕蓝轴反向切换网格面"),
+    ("Grid_MovVgFar", "パースグリッドを緑軸に沿って奥側に移動", "沿绿轴将透视网格向远处移动"),
+    ("Grid_MovVgNear", "パースグリッドを緑軸に沿って手前に移動", "沿绿轴将透视网格向近处移动"),
+    ("Grid_MovVbFar", "パースグリッドを青軸に沿って奥側に移動", "沿蓝轴将透视网格向远处移动"),
+    ("Grid_MovVbNear", "パースグリッドを青軸に沿って手前に移動", "沿蓝轴将透视网格向近处移动"),
+    ("Grid_MovVrFar", "パースグリッドを赤軸に沿って奥側に移動", "沿红轴将透视网格向远处移动"),
+    ("Grid_MovVrNear", "パースグリッドを赤軸に沿って手前に移動", "沿红轴将透视网格向近处移动"),
+    ("WnCtl_TranspArea", "描線で囲まれた透明部分", "线条围住的透明区域"),
+    ("WnCtl_SimiColArea", "色差が範囲内の部分", "色差在范围内的区域"),
+    ("WnCtl_AllSimiColPix", "色差が範囲内の全ピクセル", "色差在范围内的所有像素"),
+    ("TxTxt_Layout", "配置", "布局"),
+    ("TxCtl_Vert", "縦書き", "竖排"),
+    ("TxTxt_Color", "文字色", "文字颜色"),
+    ("TxTxt_Size", "文字サイズ", "文字大小"),
+    ("TxTxt_Px", "px", "px"),
+    ("TxCtl_Hint", "輪郭をピクセル境界に揃える", "使轮廓对齐像素边界"),
+    ("ToolOpt_Title", "ツール動作詳細", "工具行为详细设置"),
+    ("LayNam_Mask", "マスク", "蒙版"),
+    ("OldDir_Title", "PaintTool SAI Ver.2 - ブラシ形状やテクスチャ類の格納先の変更についての警告", "PaintTool SAI Ver.2 - 画笔形状与纹理存储位置变更警告"),
+    ("OldDir_Warning", "SAI Ver.2 2020-01-07進捗報告版からブラシ形状やテクスチャ類の格納先が \"<ドキュメント>\\SYSTEMAX Software Development\\SAIv2\\settings\" に\n変更されたため下記のフォルダは使用されなくなりました。これらのフォルダを削除するとこの警告は表示されなくなります。\n", "自 SAI Ver.2 2020-01-07 进度报告版起，画笔形状与纹理的存储位置已改为 \"<文档>\\SYSTEMAX Software Development\\SAIv2\\settings\"。\n因此不再使用以下文件夹。删除这些文件夹后将不再显示此警告。\n"),
+    ("OldDir_Guidance", "自作したブラシ形状やテクスチャ類がある場合は新しい格納先のそれぞれ対応するフォルダに移してから上記のフォルダを削除してください。\n(ブラシ形状の新しい格納先は \"<ドキュメント>\\SYSTEMAX Software Development\\SAIv2\\settings\\brushfom\" になることにご注意ください)", "如果有自制的画笔形状或纹理，请先将其移动到新存储位置中对应的文件夹，再删除上述文件夹。\n（请注意，画笔形状的新存储位置为 \"<文档>\\SYSTEMAX Software Development\\SAIv2\\settings\\brushfom\"）"),
+    ("JpegSave_Title", "JPEG保存", "JPEG 保存"),
+    ("JpegSaveTxt_Scale", "表示倍率:", "显示倍率："),
+    ("JpegSaveTxt_Image", "画像:", "图像："),
+    ("JpegSaveCtl_Jpeg", "JPEG画像", "JPEG 图像"),
+    ("JpegSaveTxt_Width", "水平ピクセル数 :", "水平像素数："),
+    ("JpegSaveCtl_Width", "999999", "999999"),
+    ("JpegSaveTxt_Height", "垂直ピクセル数 :", "垂直像素数："),
+    ("JpegSaveCtl_Height", "999999", "999999"),
+    ("FileViewer_Filter", "絞り込み :", "筛选："),
+    ("Asreg_Swatch", "新規ユーザーパレット", "新建用户调色板"),
+    ("Asreg_ScratchPad", "新規スクラッチパッド", "新建便签簿"),
+    ("Asreg_LayerPaper", "新規レイヤー用紙質感", "新建图层纸张纹理"),
+    ("Asreg_BrushForm", "新規ブラシ形状", "新建画笔形状"),
+    ("Asreg_Scatter", "新規散布ツール用画像", "新建散布工具图像"),
+    ("Asreg_BrushTexture", "新規ブラシテクスチャ", "新建画笔纹理"),
+    ("AsregCtl_ImgTypeBKonWH", "白背景上の黒部分", "白色背景上的黑色部分"),
+    ("AsregCtl_ImgTypeWHonBK", "黒背景上の白部分", "黑色背景上的白色部分"),
+    ("FuncCat_Test", "テスト", "测试"),
+    ("Test_DispChange", "画面解像度変更シミュレーション", "屏幕分辨率变更模拟"),
+    ("Test_DrawParts", "部品画像作成", "创建部件图像"),
+    ("WnCtl_TranspArea", "クリック位置の周囲の描線で囲まれた透明部分を領域とします。", "将单击位置周围由线条围住的透明部分作为区域。"),
+    ("WnCtl_SimiColArea", "クリック位置のピクセルの周囲で色が近い部分を領域とします。", "将单击位置像素周围颜色相近的部分作为区域。"),
+    ("WnCtl_AllSimiColPix", "クリック位置のピクセルと色が近い全ピクセルを領域とします。", "将与单击位置像素颜色相近的所有像素作为区域。"),
+    ("ToolCtl_Reserv", "ツールの現在の設定を記憶します。", "记忆工具的当前设置。"),
+    ("ToolCtl_Recall", "記憶しておいたツールの設定を復元します。\nボタンアイコンが赤い間にもう一度を押すと復元を取り消すことができます。", "恢复已记忆的工具设置。\n按钮图标为红色时再次按下，可撤销此次恢复。"),
+    ("ToolCtl_Option", "[ツール動作詳細]パネルを表示します。", "显示或隐藏“工具行为详细设置”面板。"),
+    ("OptKeyCtl_FsChgCol", "描画色切り替えのショートカットキーのシフト操作を有効にする", "启用绘图颜色切换快捷键的临时切换操作"),
+    ("OptKeyCtl_FsEnable", "一部機能のショートカットキーのシフト操作を有効にする", "启用部分功能快捷键的临时切换操作"),
+    ("OptKeyRem_FsEnable", "ビューの水平反転、定規無効モード、直線モード が対象です。", "适用于：视图水平翻转、忽略尺子和直线模式。"),
+    ("OptPrfNvCap_MaxSize", "分離時の最大サイズ", "分离时的最大尺寸"),
+    ("OptPrfNvTxt_MaxWidth", "最大幅 : ", "最大宽度："),
+    ("OptPrfNvTxt_MaxHeight", "最大高 : ", "最大高度："),
+    ("OptPrfNvTxt_TrueWidth", "実際の最大幅 : ", "实际最大宽度："),
+    ("OptPrfNvCtl_TrueWidth", "99999px (999%)", "99999px (999%)"),
+    ("OptPrfNvTxt_TrueHeight", "実際の最大高 : ", "实际最大高度："),
+    ("OptPrfNvCtl_TrueHeight", "99999px (999%)", "99999px (999%)"),
+    ("OptPrfNvRem_MaxSize", "設定可能な値は 512～4096 です。実際のピクセル数は「操作パネルの部品のサイズ」およびモニタのDPIに応じて拡大されます。", "可设置的值为 512～4096。实际像素数会根据“操作面板部件大小”和显示器 DPI 进行缩放。"),
+    ("BrCtl_ScatAllDir", "全方向に散布", "向所有方向散布"),
+    ("BrCtl_Ver1DensPrs", "筆圧濃度補正を無効化", "禁用笔压浓度校正"),
+    ("TxCtl_Bold", "太字", "粗体"),
+    ("TxCtl_Italic", "斜体", "斜体"),
+]
 
 
 def app_dir() -> Path:
@@ -65,6 +143,7 @@ class PEImage:
         self.checksum_offset = self.optional_offset + 64
         self.section_table_offset = self.optional_offset + optional_size
         self.sections: list[tuple[str, int, int, int, int]] = []
+        self.layout_modified_ranges: list[tuple[int, int]] = []
         for index in range(self.number_of_sections):
             offset = self.section_table_offset + index * 40
             name = bytes(self.data[offset:offset + 8]).rstrip(b"\0").decode("ascii", "replace")
@@ -169,7 +248,7 @@ class PEImage:
         size_of_headers = struct.unpack_from("<I", self.data, self.optional_offset + 60)[0]
         header_offset = self.section_table_offset + self.number_of_sections * 40
         if header_offset + 40 > size_of_headers or any(self.data[header_offset:header_offset + 40]):
-            raise ValueError("PE 头没有可用的新节表空间")
+            return self.extend_last_section(payload)
         last_end = max(rva + max(virtual_size, raw_size) for _n, rva, virtual_size, _o, raw_size in self.sections)
         new_rva = self._align(last_end, section_alignment)
         new_raw_offset = self._align(len(self.data), file_alignment)
@@ -188,7 +267,45 @@ class PEImage:
         struct.pack_into("<I", self.data, self.optional_offset + 8, initialized_size + new_raw_size)
         struct.pack_into("<I", self.data, self.optional_offset + 56, self._align(new_rva + len(payload), section_alignment))
         self.sections.append((name.decode("ascii"), new_rva, len(payload), new_raw_offset, new_raw_size))
+        self.layout_modified_ranges = [
+            (self.number_of_sections_offset, self.number_of_sections_offset + 2),
+            (self.optional_offset + 8, self.optional_offset + 12),
+            (self.optional_offset + 56, self.optional_offset + 60),
+            (header_offset, header_offset + 40),
+        ]
         return new_rva
+
+    def extend_last_section(self, payload: bytes) -> int:
+        """Append payload to the last physical section when no header slot remains."""
+        index, section = max(enumerate(self.sections), key=lambda item: item[1][3] + item[1][4])
+        name, section_rva, virtual_size, raw_offset, raw_size = section
+        raw_end = raw_offset + raw_size
+        if raw_end != len(self.data):
+            raise ValueError("PE 节表已满且文件含附加数据，无法安全扩展")
+        file_alignment = struct.unpack_from("<I", self.data, self.optional_offset + 36)[0]
+        section_alignment = struct.unpack_from("<I", self.data, self.optional_offset + 32)[0]
+        payload_delta = max(raw_size, virtual_size)
+        payload_offset = raw_offset + payload_delta
+        self.data.extend(b"\0" * (payload_offset - len(self.data)))
+        self.data.extend(payload)
+        new_raw_size = self._align(payload_delta + len(payload), file_alignment)
+        self.data.extend(b"\0" * (raw_offset + new_raw_size - len(self.data)))
+        new_virtual_size = payload_delta + len(payload)
+        header_offset = self.section_table_offset + index * 40
+        struct.pack_into("<I", self.data, header_offset + 8, new_virtual_size)
+        struct.pack_into("<I", self.data, header_offset + 16, new_raw_size)
+        initialized_size = struct.unpack_from("<I", self.data, self.optional_offset + 8)[0]
+        struct.pack_into("<I", self.data, self.optional_offset + 8, initialized_size + new_raw_size - raw_size)
+        size_of_image = self._align(section_rva + new_virtual_size, section_alignment)
+        struct.pack_into("<I", self.data, self.optional_offset + 56, size_of_image)
+        self.sections[index] = (name, section_rva, new_virtual_size, raw_offset, new_raw_size)
+        self.layout_modified_ranges = [
+            (self.optional_offset + 8, self.optional_offset + 12),
+            (self.optional_offset + 56, self.optional_offset + 60),
+            (header_offset + 8, header_offset + 12),
+            (header_offset + 16, header_offset + 20),
+        ]
+        return section_rva + payload_delta
 
 
 def load_translation_memory(path: Path | None = None) -> tuple[dict[str, list[dict]], dict]:
@@ -204,6 +321,10 @@ def load_translation_memory(path: Path | None = None) -> tuple[dict[str, list[di
     for item in items:
         if isinstance(item, dict) and isinstance(item.get("key"), str) and isinstance(item.get("zh_cn"), str):
             memory.setdefault(item["key"], []).append(item)
+    for key, ja, zh_cn in LEGACY_TRANSLATIONS:
+        candidates = memory.setdefault(key, [])
+        if not any(item.get("ja") == ja for item in candidates):
+            candidates.append({"key": key, "ja": ja, "zh_cn": zh_cn, "origin": "legacy-20260702b"})
     if not memory:
         raise ValueError("翻译库为空")
     return memory, data
@@ -211,13 +332,23 @@ def load_translation_memory(path: Path | None = None) -> tuple[dict[str, list[di
 
 def choose_translation(record: dict, memory: dict[str, list[dict]]) -> tuple[dict | None, str]:
     candidates = memory.get(record["key"], [])
-    if not candidates:
-        return None, "new"
     exact = [item for item in candidates if item.get("ja") == record["value"]]
     if exact:
         return exact[0], "exact"
     if record["key"] == "App_Title":
-        return candidates[0], "version_title"
+        return (candidates[0], "version_title") if candidates else (None, "new")
+    # Renamed keys are common between Preview and Alpha builds.  Reuse a
+    # translation only when the Japanese source text identifies one target
+    # unambiguously across the complete memory.
+    text_matches = [
+        item for items in memory.values() for item in items
+        if item.get("ja") == record["value"] and item.get("zh_cn")
+    ]
+    text_targets = {item["zh_cn"] for item in text_matches}
+    if text_matches and len(text_targets) == 1:
+        return text_matches[0], "text_match"
+    if not candidates:
+        return None, "new"
     translations = {item.get("zh_cn") for item in candidates if item.get("zh_cn")}
     if len(candidates) == 1 or len(translations) == 1:
         return candidates[0], "source_changed"
@@ -270,6 +401,7 @@ def analyze(source: Path, translation_path: Path | None = None) -> dict:
     changed_source = []
     new_records = []
     ambiguous_records = []
+    text_matched_records = []
     translated = 0
     for record in records:
         item, match_type = choose_translation(record, memory)
@@ -280,6 +412,8 @@ def analyze(source: Path, translation_path: Path | None = None) -> dict:
             ambiguous_records.append({"key": record["key"], "ja": record["value"]})
             continue
         translated += 1
+        if match_type == "text_match":
+            text_matched_records.append({"key": record["key"], "ja": record["value"]})
         if match_type == "source_changed" and item is not None:
             changed_source.append({
                 "key": record["key"], "old_ja": item.get("ja", ""),
@@ -291,6 +425,7 @@ def analyze(source: Path, translation_path: Path | None = None) -> dict:
         "record_count": len(records), "translated_count": translated,
         "new_records": new_records, "changed_source": changed_source,
         "ambiguous_records": ambiguous_records,
+        "text_matched_records": text_matched_records,
         "missing_old_keys": sorted(set(memory) - record_keys),
         "runs": runs, "translation_version": metadata.get("source_version", "unknown"),
     }
@@ -310,7 +445,10 @@ def calculate_pe_checksum(data: bytearray, checksum_offset: int) -> int:
     return (total + len(temp)) & 0xFFFFFFFF
 
 
-def build_patch(source: Path, output: Path, report_path: Path, translation_path: Path | None = None) -> dict:
+def build_patch(
+    source: Path, output: Path, report_path: Path,
+    translation_path: Path | None = None, ui_font: str = "Microsoft YaHei UI",
+) -> dict:
     result = analyze(source, translation_path)
     memory, _metadata = load_translation_memory(translation_path)
     image = PEImage(source)
@@ -325,7 +463,7 @@ def build_patch(source: Path, output: Path, report_path: Path, translation_path:
         if isinstance(target, str) and target and target != record["value"]:
             proposals.append((record, target))
     unique_targets = list(dict.fromkeys(target for _record, target in proposals))
-    section_strings = unique_targets + ([UI_FONT_NAME] if UI_FONT_NAME not in unique_targets else [])
+    section_strings = unique_targets + ([ui_font] if ui_font not in unique_targets else [])
     payload = bytearray()
     string_offsets = {}
     for text in section_strings:
@@ -335,19 +473,13 @@ def build_patch(source: Path, output: Path, report_path: Path, translation_path:
         reference for font in UI_FONT_SOURCES for reference in image.find_utf16_rip_references(font)
     ]
     new_section_rva = image.add_readonly_data_section(b".zhcn", bytes(payload))
-    allowed_ranges = [
-        (image.number_of_sections_offset, image.number_of_sections_offset + 2),
-        (image.optional_offset + 8, image.optional_offset + 12),
-        (image.optional_offset + 56, image.optional_offset + 60),
-        (image.section_table_offset + (image.number_of_sections - 1) * 40,
-         image.section_table_offset + image.number_of_sections * 40),
-    ]
+    allowed_ranges = list(image.layout_modified_ranges)
     for record, target in proposals:
         pointer_offset = record["record_offset"] + 16
         target_va = image.image_base + new_section_rva + string_offsets[target]
         struct.pack_into("<Q", image.data, pointer_offset, target_va)
         allowed_ranges.append((pointer_offset, pointer_offset + 8))
-    font_va = image.image_base + new_section_rva + string_offsets[UI_FONT_NAME]
+    font_va = image.image_base + new_section_rva + string_offsets[ui_font]
     for raw_offset, instruction_rva in font_references:
         displacement = font_va - (image.image_base + instruction_rva + 7)
         struct.pack_into("<i", image.data, raw_offset + 3, displacement)
@@ -367,7 +499,7 @@ def build_patch(source: Path, output: Path, report_path: Path, translation_path:
     report.update({
         "output": str(output), "output_sha256": sha256(output),
         "patched_records": len(proposals), "unique_chinese_strings": len(unique_targets),
-        "font_references_patched": len(font_references),
+        "font_references_patched": len(font_references), "ui_font": ui_font,
     })
     report_path.write_text(json.dumps(report, ensure_ascii=False, indent=2), encoding="utf-8")
     return report
@@ -386,19 +518,19 @@ def find_source(folder: Path) -> tuple[Path, Path]:
     raise FileNotFoundError(f"所选文件夹中没有 sai2.exe：{folder}")
 
 
-def patch_folder(folder: Path, log=lambda _message: None) -> dict:
+def patch_folder(folder: Path, log=lambda _message: None, ui_font: str = "Microsoft YaHei UI") -> dict:
     source, output = find_source(folder)
     log(f"分析原版：{source.name}")
     result = analyze(source)
     log(f"识别版本：{result['version']}，日文词条：{result['record_count']}")
-    log(f"可翻译：{result['translated_count']}，新增：{len(result['new_records'])}，原文变化：{len(result['changed_source'])}，歧义：{len(result['ambiguous_records'])}")
+    log(f"可翻译：{result['translated_count']}（跨版本匹配 {len(result['text_matched_records'])}），新增：{len(result['new_records'])}，原文变化：{len(result['changed_source'])}，歧义：{len(result['ambiguous_records'])}")
     backup = folder / "sai2.exe.original.bak"
     if not backup.exists():
         shutil.copy2(source, backup)
         source = backup
         log(f"已创建原版备份：{backup.name}")
     report_path = folder / "sai2_zh_adaptation_report.json"
-    report = build_patch(source, output, report_path)
+    report = build_patch(source, output, report_path, ui_font=ui_font)
     ini_path = folder / "sai2.ini"
     if ini_path.exists():
         raw = ini_path.read_bytes()
@@ -430,14 +562,14 @@ def run_gui() -> int:
     except tk.TclError:
         pass
     folder_var = tk.StringVar(value=str(app_dir()))
-    status_var = tk.StringVar(value="请选择包含 sai2.exe 的文件夹")
+    status_var = tk.StringVar(value="请选择SAI2的文件夹")
+    font_profile_var = tk.StringVar(value="1k")
 
     frame = ttk.Frame(root, padding=18)
     frame.pack(fill="both", expand=True)
     ttk.Label(frame, text=APP_NAME, font=("Microsoft YaHei UI", 18, "bold")).pack(anchor="w")
-    ttk.Label(frame, text="自动识别未知版本的语言表和字体引用；新增词条会保留原文并生成报告。", wraplength=680).pack(anchor="w", pady=(5, 16))
     row = ttk.Frame(frame)
-    row.pack(fill="x")
+    row.pack(fill="x", pady=(14, 0))
     entry = ttk.Entry(row, textvariable=folder_var)
     entry.pack(side="left", fill="x", expand=True)
 
@@ -447,6 +579,12 @@ def run_gui() -> int:
             folder_var.set(selected)
 
     ttk.Button(row, text="浏览…", command=choose_folder).pack(side="left", padx=(8, 0))
+    font_frame = ttk.LabelFrame(frame, text="中文界面字体", padding=(12, 8))
+    font_frame.pack(fill="x", pady=(12, 0))
+    for profile, (label, font_name) in FONT_PROFILES.items():
+        ttk.Radiobutton(
+            font_frame, text=f"{label}：{font_name}", variable=font_profile_var, value=profile,
+        ).pack(side="left", padx=(0, 24))
     log_box = tk.Text(frame, height=15, wrap="word", state="disabled", font=("Consolas", 10))
     log_box.pack(fill="both", expand=True, pady=14)
 
@@ -479,10 +617,13 @@ def run_gui() -> int:
         source, _output = find_source(folder)
         result = analyze(source)
         log(f"版本 {result['version']}；识别 {result['record_count']} 条；可翻译 {result['translated_count']} 条")
-        log(f"新增词条 {len(result['new_records'])} 条；原文变化 {len(result['changed_source'])} 条；歧义 {len(result['ambiguous_records'])} 条")
+        log(f"跨版本匹配 {len(result['text_matched_records'])} 条；新增 {len(result['new_records'])} 条；原文变化 {len(result['changed_source'])} 条；歧义 {len(result['ambiguous_records'])} 条")
 
     def do_patch(folder: Path):
-        report = patch_folder(folder, log)
+        profile = font_profile_var.get()
+        font_name = FONT_PROFILES.get(profile, FONT_PROFILES["1k"])[1]
+        log(f"界面字体：{font_name}")
+        report = patch_folder(folder, log, font_name)
         root.after(0, lambda: messagebox.showinfo(APP_NAME, f"汉化完成！\n已替换 {report['patched_records']} 条界面文字。"))
 
     def do_restore(folder: Path):
@@ -511,6 +652,7 @@ def main() -> int:
     parser.add_argument("folder", nargs="?", type=Path, help="包含 sai2.exe 的目录")
     parser.add_argument("--analyze", action="store_true", help="只分析，不修改")
     parser.add_argument("--no-gui", action="store_true", help="使用命令行模式")
+    parser.add_argument("--font-profile", choices=FONT_PROFILES, default="1k", help="中文字体档位")
     parser.add_argument("--ui-smoke-test", action="store_true", help=argparse.SUPPRESS)
     args = parser.parse_args()
     if args.ui_smoke_test:
@@ -529,7 +671,7 @@ def main() -> int:
         printable = {key: value for key, value in result.items() if key != "records"}
         print(json.dumps(printable, ensure_ascii=False, indent=2))
     else:
-        patch_folder(folder, print)
+        patch_folder(folder, print, FONT_PROFILES[args.font_profile][1])
     return 0
 
 
